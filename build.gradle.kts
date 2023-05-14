@@ -16,8 +16,6 @@ dependencies {
     implementation("io.grpc:grpc-api:1.55.1")
     implementation("com.hivemq:hivemq-mqtt-client:1.3.1")
     implementation("org.slf4j:slf4j-api:2.0.7")
-    // TODO: necessary?
-    implementation("javax.annotation:javax.annotation-api:1.3.2")
 
 
     testImplementation(platform("org.junit:junit-bom:5.9.1"))
@@ -63,7 +61,7 @@ val intTestImplementation by configurations.getting {
 configurations["intTestRuntimeOnly"].extendsFrom(configurations.runtimeOnly.get())
 
 dependencies {
-    // TODO deduplicate
+    intTestImplementation("javax.annotation:javax.annotation-api:1.3.2")
     intTestImplementation("org.slf4j:slf4j-simple:2.0.7")
     intTestImplementation("org.assertj:assertj-core:3.24.2")
 
