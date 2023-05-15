@@ -4,18 +4,39 @@ Just playing around with the idea of using MQTT5 as a transport protocol for gRP
 
 MQTT5 introduces nifty concepts such as correlation data and response topics to accommodate such use cases.
 
+Check the [integration test](src/intTest/java/MqttGrpcIntegrationTest.java) for a simple usage example.
+
+## Topic structure and MQTT semantics
+
+The topic structure of this implementation is defined as follows:
+
+```
+* topicPrefix (common MQTT topic prefix on client and server)
+|
+\-- /responses/<clientId>/<full method name>: MqttChannels subscribe here to receive responses from the servers
+\-- /endpoints/<full method name>: MqttServers subscribe here to receive queries from clients
+\-- /ping: MqttChannels publish here to verify that an MqttServer is present at this topic structure. (optional) 
+```
+
+The only really fixed part of this topic structure is the `topicPrefix/endpoints/<full method name>`. The Server
+actually does not care about the response topic structure since it just uses the response topic for responding, so
+custom implementations are easy.
+
 ## TODOs
 
 * Ensure MQTT client is properly configurable for advanced scenarios (configurable reconnect backoff, security
   configurations etc.)
 * Support shared subscription: The server side should support shared subscriptions such that horizontal scaling becomes
   easy by sharding to different MqttServer instances.
-* Error handling: Does it make sense to ACK publishes late only after ensuring that they can be unmarshaled on a Server
+* Error handling: Does it make sense to ACK publishes late only after ensuring that they can be unmarshalled on a Server
   instance? (+ other error cases, needs lots of testing)
 * Backpressure handling + scale testing: Everything is currently loosely thrown together, but there are many
   opportunities here for backpressure handling making it scale well
 * well-defined topic structure: currently, it's simply `customPrefix + gRPC method name [ + responses / clientID ]`.
   There is no notion of a server name etc. (Perhaps this is a good thing?)
+* Ensure polyglot compatibility: Right now it's just a java implementation. It's TBD if all the assumptions made during
+  this implementation (esp. if fullMethodName reflects exactly the same in other languages) will carry over nicely when
+  talking to an implementation in another language (e.g. a javascript implementation of this same concept)
 
 ## Example
 
