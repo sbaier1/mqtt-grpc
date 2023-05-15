@@ -4,6 +4,7 @@ import com.hivemq.client.mqtt.MqttClient;
 import com.hivemq.client.mqtt.MqttClientBuilder;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient;
+import com.hivemq.client.mqtt.mqtt5.Mqtt5ClientConnectionConfig;
 import com.hivemq.client.mqtt.mqtt5.message.Mqtt5ReasonCode;
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5PublishResult;
 import com.hivemq.client.mqtt.mqtt5.message.subscribe.suback.Mqtt5SubAck;
@@ -34,13 +35,24 @@ public class MqttChannel extends Channel {
     private final List<String> registeredResponseTopics;
 
     private final Map<String, ClientCall.Listener<?>> listeners;
+    private final List<ClientInterceptor> interceptors;
+    private final Channel actualChannel;
 
-    private MqttChannel(Mqtt5AsyncClient mqttClient, String topicPrefix, String clientId) {
+    private MqttChannel(Mqtt5AsyncClient mqttClient,
+                        String topicPrefix,
+                        String clientId,
+                        List<ClientInterceptor> interceptors) {
         this.mqttClient = mqttClient;
         this.topicPrefix = topicPrefix;
         this.clientId = clientId;
         registeredResponseTopics = new CopyOnWriteArrayList<>();
         listeners = new ConcurrentHashMap<>();
+        this.interceptors = interceptors;
+        if (interceptors.size() > 0) {
+            actualChannel = ClientInterceptors.intercept(new ActualMqttChannel(), interceptors);
+        } else {
+            actualChannel = new ActualMqttChannel();
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -53,115 +65,15 @@ public class MqttChannel extends Channel {
     }
 
     @Override
-    public String authority() {
-        // Return the appropriate authority, or null if it doesn't apply in your use case
-        return null;
+    public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(MethodDescriptor<RequestT, ResponseT> methodDescriptor, CallOptions callOptions) {
+        return actualChannel.newCall(methodDescriptor, callOptions);
     }
 
     @Override
-    public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions) {
-        String correlationId = UUID.randomUUID().toString();
-        final String methodQueryTopic = topicPrefix + ENDPOINTS_INFIX + method.getFullMethodName();
-        final String methodResponseTopic = topicPrefix + RESPONSES_INFIX + clientId + method.getFullMethodName();
-        return new ClientCall<>() {
-            @Override
-            public void start(Listener<RespT> responseListener, Metadata headers) {
-                listeners.put(correlationId, responseListener);
-                if (!registeredResponseTopics.contains(methodResponseTopic)) {
-                    mqttClient.subscribeWith()
-                            .topicFilter(methodResponseTopic)
-                            .qos(MqttQos.AT_LEAST_ONCE)
-                            .callback(publish -> {
-                                try {
-                                    final Optional<ByteBuffer> correlationData = publish.getCorrelationData();
-                                    if (correlationData.isEmpty()) {
-                                        log.error("No correlation data found in PUBLISH on topic {}, ignoring", publish.getTopic());
-                                    } else {
-                                        byte[] correlationBytes = new byte[correlationData.get().remaining()];
-                                        correlationData.get().get(correlationBytes);
-                                        String correlationId = new String(correlationBytes, StandardCharsets.UTF_8);
-                                        if (listeners.containsKey(correlationId)) {
-                                            InputStream payloadStream = new ByteArrayInputStream(publish.getPayloadAsBytes());
-                                            Object response = method.getResponseMarshaller().parse(payloadStream);
-                                            if (response != null) {
-                                                final Listener<?> listener = listeners.get(correlationId);
-                                                // Ensure we notify listener in the caller's executor
-                                                CompletableFuture.runAsync(() -> {
-                                                    listener.onHeaders(headers);
-                                                    castListener(listener).onMessage(response);
-                                                    listener.onReady();
-                                                    listener.onClose(Status.OK, new Metadata());
-                                                    // Handled, remove again
-                                                    listeners.remove(correlationId);
-                                                }, callOptions.getExecutor());
-                                            } else {
-                                                if (Arrays.equals(NOT_IMPLEMENTED_PAYLOAD, publish.getPayloadAsBytes())) {
-                                                    log.error("Received method not implemented on topic {}", publish.getTopic());
-                                                } else {
-                                                    log.error("Failed to unmarshal protobuf message on topic {}", publish.getTopic());
-                                                }
-                                            }
-                                        } else {
-                                            log.warn("Could not find a listener for message with correlation ID {}, ignoring", correlationId);
-                                        }
-                                    }
-                                } catch (Exception ex) {
-                                    log.error("Unexpected error in response callback", ex);
-                                }
-                            })
-                            .send()
-                            .whenComplete((subAck, throwable) -> {
-                                if (throwable != null) {
-                                    // Handle subscription failure
-                                    log.error("Failed to subscribe to topic {}", topicPrefix);
-                                }
-                            });
-                    registeredResponseTopics.add(methodResponseTopic);
-                }
-            }
-
-            @Override
-            public void request(int numMessages) {
-                // No-op
-            }
-
-            @Override
-            public void cancel(String message, Throwable cause) {
-                log.error("Canceling call. message {} cause", message, cause);
-                mqttClient.disconnect();
-            }
-
-            @Override
-            public void halfClose() {
-                // No-op
-            }
-
-            @Override
-            public void sendMessage(ReqT message) {
-                // Serialize the message using the method's marshaller
-                InputStream serializedMessageStream = method.getRequestMarshaller().stream(message);
-                final ByteBuffer payloadBuffer;
-                try {
-                    payloadBuffer = ByteBuffer.wrap(serializedMessageStream.readAllBytes());
-                } catch (IOException e) {
-                    log.error("Failed to serialize request", e);
-                    return;
-                }
-                mqttClient.toAsync().publishWith()
-                        .topic(methodQueryTopic)
-                        .responseTopic(methodResponseTopic)
-                        .correlationData(correlationId.getBytes(StandardCharsets.UTF_8))
-                        .payload(payloadBuffer)
-                        .qos(MqttQos.AT_LEAST_ONCE)
-                        .send()
-                        .whenComplete((publish, throwable) -> {
-                            if (throwable != null) {
-                                log.error("Failed to publish on topic {}", methodQueryTopic);
-                                // Handle publish failure
-                            }
-                        });
-            }
-        };
+    public String authority() {
+        final Optional<Mqtt5ClientConnectionConfig> config = mqttClient.getConfig().getConnectionConfig();
+        return config.map(mqtt5ClientConnectionConfig -> mqtt5ClientConnectionConfig.getTransportConfig().getServerAddress().getHostName())
+                .orElse(null);
     }
 
     public static class Builder {
@@ -175,10 +87,13 @@ public class MqttChannel extends Channel {
         private String topicPrefix;
 
         private String clientId;
+        private final List<ClientInterceptor> interceptors;
+
         private Builder() {
             clientBuilder = MqttClient.builder();
             pingService = true;
             pingDeadlineSeconds = 30;
+            interceptors = new ArrayList<>();
         }
 
         public Builder brokerAddress(String brokerUrl) {
@@ -202,13 +117,18 @@ public class MqttChannel extends Channel {
             return this;
         }
 
-        public Builder setPingDeadlineSeconds(int pingDeadlineSeconds) {
+        public Builder pingDeadlineSeconds(int pingDeadlineSeconds) {
             this.pingDeadlineSeconds = pingDeadlineSeconds;
             return this;
         }
 
         public Builder port(int port) {
             this.port = port;
+            return this;
+        }
+
+        public Builder intercept(ClientInterceptor... interceptor) {
+            this.interceptors.addAll(List.of(interceptor));
             return this;
         }
 
@@ -237,7 +157,7 @@ public class MqttChannel extends Channel {
             if (topicPrefix == null || topicPrefix.isBlank()) {
                 throw new IllegalStateException("topic must not be empty");
             }
-            return new MqttChannel(mqttClient, topicPrefix, clientId);
+            return new MqttChannel(mqttClient, topicPrefix, clientId, interceptors);
         }
 
         private void pingService(Mqtt5AsyncClient mqttClient) {
@@ -275,6 +195,122 @@ public class MqttChannel extends Channel {
                     throw new IllegalStateException("Interrupted while pinging service");
                 }
             }
+        }
+    }
+
+    public final class ActualMqttChannel extends Channel {
+
+        @Override
+        public String authority() {
+            // Return the appropriate authority, or null if it doesn't apply in your use case
+            return null;
+        }
+
+        @Override
+        public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions) {
+            String correlationId = UUID.randomUUID().toString();
+            final String methodQueryTopic = topicPrefix + ENDPOINTS_INFIX + method.getFullMethodName();
+            final String methodResponseTopic = topicPrefix + RESPONSES_INFIX + clientId + method.getFullMethodName();
+
+            return new ClientCall<>() {
+                @Override
+                public void start(Listener<RespT> responseListener, Metadata headers) {
+                    listeners.put(correlationId, responseListener);
+                    if (!registeredResponseTopics.contains(methodResponseTopic)) {
+                        mqttClient.subscribeWith()
+                                .topicFilter(methodResponseTopic)
+                                .qos(MqttQos.AT_LEAST_ONCE)
+                                .callback(publish -> {
+                                    try {
+                                        final Optional<ByteBuffer> correlationData = publish.getCorrelationData();
+                                        if (correlationData.isEmpty()) {
+                                            log.error("No correlation data found in PUBLISH on topic {}, ignoring", publish.getTopic());
+                                        } else {
+                                            byte[] correlationBytes = new byte[correlationData.get().remaining()];
+                                            correlationData.get().get(correlationBytes);
+                                            String correlationId1 = new String(correlationBytes, StandardCharsets.UTF_8);
+                                            if (listeners.containsKey(correlationId1)) {
+                                                InputStream payloadStream = new ByteArrayInputStream(publish.getPayloadAsBytes());
+                                                Object response = method.getResponseMarshaller().parse(payloadStream);
+                                                if (response != null) {
+                                                    final Listener<?> listener = listeners.get(correlationId1);
+                                                    // Ensure we notify listener in the caller's executor
+                                                    CompletableFuture.runAsync(() -> {
+                                                        listener.onHeaders(headers);
+                                                        castListener(listener).onMessage(response);
+                                                        listener.onReady();
+                                                        listener.onClose(Status.OK, new Metadata());
+                                                        // Handled, remove again
+                                                        listeners.remove(correlationId1);
+                                                    }, callOptions.getExecutor());
+                                                } else {
+                                                    if (Arrays.equals(NOT_IMPLEMENTED_PAYLOAD, publish.getPayloadAsBytes())) {
+                                                        log.error("Received method not implemented on topic {}", publish.getTopic());
+                                                    } else {
+                                                        log.error("Failed to unmarshal protobuf message on topic {}", publish.getTopic());
+                                                    }
+                                                }
+                                            } else {
+                                                log.warn("Could not find a listener for message with correlation ID {}, ignoring", correlationId1);
+                                            }
+                                        }
+                                    } catch (Exception ex) {
+                                        log.error("Unexpected error in response callback", ex);
+                                    }
+                                })
+                                .send()
+                                .whenComplete((subAck, throwable) -> {
+                                    if (throwable != null) {
+                                        // Handle subscription failure
+                                        log.error("Failed to subscribe to topic {}", topicPrefix);
+                                    }
+                                });
+                        registeredResponseTopics.add(methodResponseTopic);
+                    }
+                }
+
+                @Override
+                public void request(int numMessages) {
+                    // No-op
+                }
+
+                @Override
+                public void cancel(String message, Throwable cause) {
+                    log.error("Canceling call. message {} cause", message, cause);
+                    mqttClient.disconnect();
+                }
+
+                @Override
+                public void halfClose() {
+                    // No-op
+                }
+
+                @Override
+                public void sendMessage(ReqT message) {
+                    // Serialize the message using the method's marshaller
+                    InputStream serializedMessageStream = method.getRequestMarshaller().stream(message);
+                    final ByteBuffer payloadBuffer;
+                    try {
+                        payloadBuffer = ByteBuffer.wrap(serializedMessageStream.readAllBytes());
+                    } catch (IOException e) {
+                        log.error("Failed to serialize request", e);
+                        return;
+                    }
+                    mqttClient.toAsync().publishWith()
+                            .topic(methodQueryTopic)
+                            .responseTopic(methodResponseTopic)
+                            .correlationData(correlationId.getBytes(StandardCharsets.UTF_8))
+                            .payload(payloadBuffer)
+                            .qos(MqttQos.AT_LEAST_ONCE)
+                            .send()
+                            .whenComplete((publish, throwable) -> {
+                                if (throwable != null) {
+                                    log.error("Failed to publish on topic {}", methodQueryTopic);
+                                    // Handle publish failure
+                                }
+                            });
+                }
+            };
         }
     }
 }

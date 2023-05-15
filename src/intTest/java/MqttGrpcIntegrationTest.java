@@ -2,6 +2,7 @@ import com.hivemq.client.mqtt.MqttClient;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient;
 import com.hivemq.testcontainer.core.HiveMQTestContainerCore;
+import io.grpc.*;
 import io.grpc.stub.StreamObserver;
 import io.mqttgrpc.client.MqttChannel;
 import io.mqttgrpc.server.MqttServer;
@@ -9,6 +10,7 @@ import org.example.grpc.PingRequest;
 import org.example.grpc.PingResponse;
 import org.example.grpc.PingServiceGrpc;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -52,6 +54,7 @@ public class MqttGrpcIntegrationTest {
                 .brokerAddress(brokerUrl)
                 .port(mqttPort)
                 .addService(getMockImpl())
+                .addInterceptor(getNoopInterceptor())
                 .build();
         mqttServer.start();
 
@@ -61,8 +64,91 @@ public class MqttGrpcIntegrationTest {
                 .topicPrefix(topicPrefix)
                 .brokerAddress(brokerUrl)
                 .port(mqttPort)
+                .intercept(getSampleInterceptor())
                 .build();
         client = PingServiceGrpc.newBlockingStub(mqttChannel);
+    }
+
+
+    @AfterAll
+    static void teardown() {
+        mqttServer.stop();
+    }
+
+    @NotNull
+    private static ServerInterceptor getNoopInterceptor() {
+        return new ServerInterceptor() {
+            @Override
+            public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+                final ServerCall.Listener<ReqT> listener = next.startCall(call, headers);
+                return new ServerCall.Listener<ReqT>() {
+                    @Override
+                    public void onMessage(ReqT message) {
+                        System.out.println("Intercepted request example: " + message);
+                        // Process the request message
+
+                        // Forward the message to the next listener in the chain
+                        listener.onMessage(message);
+                    }
+
+                    @Override
+                    public void onHalfClose() {
+                        // Handle the client indicating it has finished sending messages
+                        listener.onHalfClose();
+                    }
+
+                    @Override
+                    public void onCancel() {
+                        // Handle cancellation of the RPC call
+                        listener.onCancel();
+                    }
+
+
+                    @Override
+                    public void onComplete() {
+                        // Handle the completion of the RPC call
+                        listener.onComplete();
+                    }
+                };
+            }
+        };
+    }
+
+    @NotNull
+    private static ClientInterceptor getSampleInterceptor() {
+        return new ClientInterceptor() {
+            @Override
+            public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+                final ClientCall<ReqT, RespT> clientCall = next.newCall(method, callOptions);
+                return new ClientCall<ReqT, RespT>() {
+                    @Override
+                    public void start(Listener<RespT> responseListener, Metadata headers) {
+                        clientCall.start(responseListener, headers);
+                    }
+
+                    @Override
+                    public void request(int numMessages) {
+                        clientCall.request(2);
+                    }
+
+                    @Override
+                    public void cancel(@Nullable String message, @Nullable Throwable cause) {
+                        clientCall.cancel(message, cause);
+                    }
+
+                    @Override
+                    public void halfClose() {
+                        clientCall.halfClose();
+                    }
+
+                    @Override
+                    public void sendMessage(ReqT message) {
+                        System.out.println("Intercepted client call example " + message);
+                        clientCall.sendMessage(message);
+                    }
+                };
+            }
+        };
     }
 
     private static void setupObserverClient(Integer mqttPort) {
@@ -83,6 +169,15 @@ public class MqttGrpcIntegrationTest {
                 .join();
     }
 
+    @Test
+    void pingRequest_ExpectPongResponse() {
+        PingRequest request = PingRequest.newBuilder()
+                .setPayload("Hello")
+                .build();
+        PingResponse response = client.ping(request);
+        assertThat(response.getPayload()).isEqualTo("Pong: Hello");
+    }
+
     @NotNull
     private static PingServiceGrpc.PingServiceImplBase getMockImpl() {
         return new PingServiceGrpc.PingServiceImplBase() {
@@ -96,17 +191,4 @@ public class MqttGrpcIntegrationTest {
         };
     }
 
-    @AfterAll
-    static void teardown() {
-        mqttServer.stop();
-    }
-
-    @Test
-    void pingRequest_ExpectPongResponse() {
-        PingRequest request = PingRequest.newBuilder()
-                .setPayload("Hello")
-                .build();
-        PingResponse response = client.ping(request);
-        assertThat(response.getPayload()).isEqualTo("Pong: Hello");
-    }
 }
