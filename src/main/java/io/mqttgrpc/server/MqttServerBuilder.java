@@ -48,6 +48,7 @@ public class MqttServerBuilder {
     private String username;
 
     private boolean respondNotImplemented;
+    private MqttQos qos;
 
     public MqttServerBuilder() {
         services = new ArrayList<>();
@@ -55,6 +56,7 @@ public class MqttServerBuilder {
         clientBuilder = MqttClient.builder();
         useExistingClient = false;
         respondNotImplemented = true;
+        qos = MqttQos.AT_LEAST_ONCE;
     }
 
     public MqttServerBuilder brokerAddress(String brokerUrl) {
@@ -105,6 +107,11 @@ public class MqttServerBuilder {
 
     public MqttServerBuilder topicPrefix(String topicPrefix) {
         this.topicPrefix = topicPrefix;
+        return this;
+    }
+
+    public MqttServerBuilder qos(MqttQos qos) {
+        this.qos = qos;
         return this;
     }
 
@@ -183,7 +190,7 @@ public class MqttServerBuilder {
         addServicePingResponder();
         addNotImplementedResponder();
 
-        return new MqttServer(client, services, interceptors, topicPrefix);
+        return new MqttServer(client, services, interceptors, topicPrefix, qos);
     }
 
     private void addNotImplementedResponder() {

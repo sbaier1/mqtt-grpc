@@ -27,12 +27,14 @@ public class MqttServerCall<ReqT, RespT> extends ServerCall<ReqT, RespT> {
     private final Mqtt5Client mqttClient;
     private final Mqtt5Publish publish;
     private final MethodDescriptor<ReqT, RespT> methodDescriptor;
+    private final MqttQos qos;
     private boolean sendCalled = false;
 
-    public MqttServerCall(Mqtt5Client mqttClient, Mqtt5Publish publish, MethodDescriptor<ReqT, RespT> methodDescriptor) {
+    public MqttServerCall(Mqtt5Client mqttClient, Mqtt5Publish publish, MethodDescriptor<ReqT, RespT> methodDescriptor, MqttQos qos) {
         this.mqttClient = mqttClient;
         this.publish = publish;
         this.methodDescriptor = methodDescriptor;
+        this.qos = qos;
     }
 
     @Override
@@ -76,7 +78,7 @@ public class MqttServerCall<ReqT, RespT> extends ServerCall<ReqT, RespT> {
             final Optional<ByteBuffer> correlationData = publish.getCorrelationData();
             mqttClient.toAsync().publishWith()
                     .topic(responseTopic)
-                    .qos(MqttQos.AT_LEAST_ONCE)
+                    .qos(qos)
                     .payload(responsePayload)
                     .correlationData(correlationData.orElse(null))
                     .send()
