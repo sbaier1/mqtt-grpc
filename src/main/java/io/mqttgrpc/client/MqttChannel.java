@@ -41,7 +41,7 @@ public class MqttChannel extends Channel {
     private final Map<String, ScheduledFuture<?>> timeoutTasks;
     private final Channel actualChannel;
     private final MqttQos qos;
-    private final ScheduledExecutorService timer;
+    private final ScheduledExecutorService timeoutExecutor;
 
     MqttChannel(Mqtt5AsyncClient mqttClient,
                 String topicPrefix,
@@ -54,7 +54,7 @@ public class MqttChannel extends Channel {
         this.clientId = clientId;
         this.timeoutSeconds = timeoutSeconds;
         this.qos = qos;
-        this.timer = Executors.newSingleThreadScheduledExecutor();
+        this.timeoutExecutor = Executors.newSingleThreadScheduledExecutor();
         registeredResponseTopics = new CopyOnWriteArrayList<>();
         listeners = new ConcurrentHashMap<>();
         if (interceptors.size() > 0) {
@@ -84,6 +84,10 @@ public class MqttChannel extends Channel {
         final Optional<Mqtt5ClientConnectionConfig> config = mqttClient.getConfig().getConnectionConfig();
         return config.map(mqtt5ClientConnectionConfig -> mqtt5ClientConnectionConfig.getTransportConfig().getServerAddress().getHostName())
                 .orElse(null);
+    }
+
+    public void close() {
+        this.mqttClient.disconnect();
     }
 
 
@@ -221,12 +225,12 @@ public class MqttChannel extends Channel {
                             .send();
                     // Timeout handling
                     sendFuture.thenRunAsync(() -> {
-                        timeoutTasks.put(correlationId, timer.schedule(() -> {
-                            log.warn("Request to method {} for correlation id {} timed out", method.getFullMethodName(), correlationId);
-                            final Map<String, Listener<?>> correlationIdToListeners = listeners.get(method.getFullMethodName());
-                            correlationIdToListeners.get(correlationId).onClose(Status.CANCELLED, new Metadata());
-                            correlationIdToListeners.remove(correlationId);
-                        }, timeoutSeconds, TimeUnit.SECONDS));
+                        if (callOptions.getDeadline() != null) {
+                            // Deadline set by client, use that instead of the global timeout
+                            callOptions.getDeadline().runOnExpiration(getTimeoutTask(), timeoutExecutor);
+                        } else {
+                            timeoutTasks.put(correlationId, timeoutExecutor.schedule(getTimeoutTask(), timeoutSeconds, TimeUnit.SECONDS));
+                        }
                     });
                     sendFuture
                             .whenComplete((publish, throwable) -> {
@@ -235,6 +239,20 @@ public class MqttChannel extends Channel {
                                     // Handle publish failure
                                 }
                             });
+                }
+
+                private Runnable getTimeoutTask() {
+                    return () -> {
+                        log.warn("Request to method {} for correlation id {} timed out", method.getFullMethodName(), correlationId);
+                        final Map<String, Listener<?>> correlationIdToListeners = listeners.get(method.getFullMethodName());
+                        CompletableFuture.runAsync(() -> {
+                                    final Listener<?> listener = correlationIdToListeners.get(correlationId);
+                                    listener.onClose(Status.CANCELLED, new Metadata());
+                                    System.out.println(listener);
+                                }, callOptions.getExecutor())
+                                .join();
+                        correlationIdToListeners.remove(correlationId);
+                    };
                 }
             };
         }

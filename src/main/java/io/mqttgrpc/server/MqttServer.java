@@ -100,9 +100,9 @@ public class MqttServer {
             if (methodDefinition == null) {
                 // Handle method not found
                 // You might want to send an MQTT message with an appropriate error status
-                log.error("Could not find method for inferred method name {}. Cannot handle request.", methodName);
+                log.error("Could not find method for inferred method name {}. Cannot handle request. Original topic name: {}", methodName, publish.getTopic());
                 // Try ensuring that the callback fails, so we don't ack the PUBLISH. TBD if this works at all. something like this could be useful though. not sure.
-                throw new IllegalStateException("Failed to handle request on method" + methodName);
+                throw new IllegalStateException("Failed to handle request on method " + methodName);
             }
 
             dispatchMessage(publish, methodDefinition, headers);
@@ -110,7 +110,11 @@ public class MqttServer {
 
         private String getMethodNameFromPublish(String topicPrefix, Mqtt5Publish publish) {
             String topic = publish.getTopic().toString();
-            return topic.substring((topicPrefix + ENDPOINTS_INFIX).length());
+            // Remove shared group prefix if any (it's not present in received publishes)
+            final String topicPrefixWithoutSharedGroup = topicPrefix
+                    .replaceAll("^\\$share/[^/]+/", "");
+            return topic
+                    .substring((topicPrefixWithoutSharedGroup + ENDPOINTS_INFIX).length());
         }
 
         private <ReqT, RespT> void dispatchMessage(Mqtt5Publish publish, ServerMethodDefinition<ReqT, RespT> methodDefinition, Metadata headers) {

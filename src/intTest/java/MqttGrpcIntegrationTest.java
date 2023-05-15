@@ -20,8 +20,10 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.io.IOException;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * @author Simon Baier
@@ -38,16 +40,30 @@ public class MqttGrpcIntegrationTest {
     private static MqttServer mqttServer;
     private static PingServiceGrpc.PingServiceBlockingStub client;
     private static MqttChannel mqttChannel;
+    private static Integer mqttPort;
+    private static String brokerUrl;
+    private static String topicPrefix;
 
     @BeforeAll
     static void setup() throws IOException {
         // Start the MQTT server
-        String brokerUrl = "localhost";
-        final Integer mqttPort = mqttBroker.getMappedPort(MQTT_PORT);
-        final String topicPrefix = "grpc/server";
+        brokerUrl = "localhost";
+        mqttPort = mqttBroker.getMappedPort(MQTT_PORT);
+        topicPrefix = "grpc/server";
 
         setupObserverClient(mqttPort);
         System.out.println("MQTT port " + mqttPort);
+    }
+
+    @AfterAll
+    static void teardown() {
+        if (mqttServer != null) {
+            mqttServer.stop();
+        }
+    }
+
+    @Test
+    void pingRequest_ExpectPongResponse() {
         mqttServer = MqttServer.builder()
                 .clientId("server")
                 .topicPrefix(topicPrefix)
@@ -67,12 +83,83 @@ public class MqttGrpcIntegrationTest {
                 .intercept(getSampleInterceptor())
                 .build();
         client = PingServiceGrpc.newBlockingStub(mqttChannel);
+
+        PingRequest request = PingRequest.newBuilder()
+                .setPayload("Hello")
+                .build();
+        PingResponse response = client.ping(request);
+        assertThat(response.getPayload()).isEqualTo("Pong: Hello");
+
+        mqttServer.stop();
+        mqttChannel.close();
     }
 
+    @Test
+    void pingPong_shared_subscription() {
+        mqttServer = MqttServer.builder()
+                .clientId("server")
+                .topicPrefix("$share/group1/" + topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .addService(getMockImpl())
+                .addInterceptor(getNoopInterceptor())
+                .build();
+        mqttServer.start();
 
-    @AfterAll
-    static void teardown() {
+        // Create the gRPC channel using the MqttChannel implementation
+        mqttChannel = MqttChannel.builder()
+                .clientId("client")
+                .topicPrefix(topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .intercept(getSampleInterceptor())
+                .build();
+        client = PingServiceGrpc.newBlockingStub(mqttChannel);
+
+        PingRequest request = PingRequest.newBuilder()
+                .setPayload("Hello")
+                .build();
+        PingResponse response = client.ping(request);
+        assertThat(response.getPayload()).isEqualTo("Pong: Hello");
+
         mqttServer.stop();
+        mqttChannel.close();
+    }
+
+    @Test
+    void pingPong_pingService_noServer() {
+        // Create the gRPC channel using the MqttChannel implementation
+        assertThatThrownBy(() -> MqttChannel.builder()
+                .clientId("client")
+                .topicPrefix(topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .intercept(getSampleInterceptor())
+                .pingDeadlineSeconds(5)
+                .build(), "starting the channel must time out due to missing backend");
+    }
+
+    // TODO test case: server is present but does not implement method
+
+    @Test
+    void pingPong_noPingService_noServer() {
+        // Create the gRPC channel using the MqttChannel implementation
+        mqttChannel = MqttChannel.builder()
+                .clientId("client")
+                .topicPrefix(topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .intercept(getSampleInterceptor())
+                .pingService(false)
+                .timeout(2)
+                .build();
+        client = PingServiceGrpc.newBlockingStub(mqttChannel);
+
+        PingRequest request = PingRequest.newBuilder()
+                .setPayload("Hello")
+                .build();
+        assertThatThrownBy(() -> client.withDeadlineAfter(5, TimeUnit.SECONDS).ping(request), "client query must time out");
+        mqttChannel.close();
     }
 
     @NotNull
@@ -169,15 +256,6 @@ public class MqttGrpcIntegrationTest {
                 .join();
     }
 
-    @Test
-    void pingRequest_ExpectPongResponse() {
-        PingRequest request = PingRequest.newBuilder()
-                .setPayload("Hello")
-                .build();
-        PingResponse response = client.ping(request);
-        assertThat(response.getPayload()).isEqualTo("Pong: Hello");
-    }
-
     @NotNull
     private static PingServiceGrpc.PingServiceImplBase getMockImpl() {
         return new PingServiceGrpc.PingServiceImplBase() {
@@ -190,5 +268,4 @@ public class MqttGrpcIntegrationTest {
             }
         };
     }
-
 }

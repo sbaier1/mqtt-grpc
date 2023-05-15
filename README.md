@@ -22,18 +22,12 @@ The only really fixed part of this topic structure is the `topicPrefix/endpoints
 actually does not care about the response topic structure since it just uses the response topic for responding, so
 custom implementations are easy.
 
+MqttServers can use shared subscriptions as their topic prefix to facilitate horizontal scaling automatically.
+
 ## TODOs
 
-* Ensure MQTT client is properly configurable for advanced scenarios (configurable reconnect backoff, security
-  configurations etc.)
-* Support shared subscription: The server side should support shared subscriptions such that horizontal scaling becomes
-  easy by sharding to different MqttServer instances.
-* Error handling: Does it make sense to ACK publishes late only after ensuring that they can be unmarshalled on a Server
-  instance? (+ other error cases, needs lots of testing)
 * Backpressure handling + scale testing: Everything is currently loosely thrown together, but there are many
   opportunities here for backpressure handling making it scale well
-* well-defined topic structure: currently, it's simply `customPrefix + gRPC method name [ + responses / clientID ]`.
-  There is no notion of a server name etc. (Perhaps this is a good thing?)
 * Ensure polyglot compatibility: Right now it's just a java implementation. It's TBD if all the assumptions made during
   this implementation (esp. if fullMethodName reflects exactly the same in other languages) will carry over nicely when
   talking to an implementation in another language (e.g. a javascript implementation of this same concept)
