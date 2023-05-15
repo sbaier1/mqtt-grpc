@@ -1,9 +1,12 @@
-package client;
+package io.mqttgrpc.client;
 
 import com.hivemq.client.mqtt.MqttClient;
 import com.hivemq.client.mqtt.MqttClientBuilder;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient;
+import com.hivemq.client.mqtt.mqtt5.message.Mqtt5ReasonCode;
+import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5PublishResult;
+import com.hivemq.client.mqtt.mqtt5.message.subscribe.suback.Mqtt5SubAck;
 import io.grpc.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,13 +16,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.*;
+import java.util.concurrent.*;
+
+import static io.mqttgrpc.Constants.*;
 
 /**
  * A gRPC Channel implementation that uses MQTT5 as its transport protocol
@@ -28,16 +28,16 @@ public class MqttChannel extends Channel {
     private static final Logger log = LoggerFactory.getLogger(MqttChannel.class);
 
     private final Mqtt5AsyncClient mqttClient;
-    private final String topic;
+    private final String topicPrefix;
     private final String clientId;
 
     private final List<String> registeredResponseTopics;
 
     private final Map<String, ClientCall.Listener<?>> listeners;
 
-    private MqttChannel(Mqtt5AsyncClient mqttClient, String topic, String clientId) {
+    private MqttChannel(Mqtt5AsyncClient mqttClient, String topicPrefix, String clientId) {
         this.mqttClient = mqttClient;
-        this.topic = topic;
+        this.topicPrefix = topicPrefix;
         this.clientId = clientId;
         registeredResponseTopics = new CopyOnWriteArrayList<>();
         listeners = new ConcurrentHashMap<>();
@@ -61,8 +61,8 @@ public class MqttChannel extends Channel {
     @Override
     public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions) {
         String correlationId = UUID.randomUUID().toString();
-        final String methodTopic = topic + method.getFullMethodName();
-        final String methodResponseTopic = methodTopic + "/responses/" + clientId;
+        final String methodQueryTopic = topicPrefix + ENDPOINTS_INFIX + method.getFullMethodName();
+        final String methodResponseTopic = topicPrefix + RESPONSES_INFIX + clientId + method.getFullMethodName();
         return new ClientCall<>() {
             @Override
             public void start(Listener<RespT> responseListener, Metadata headers) {
@@ -95,7 +95,11 @@ public class MqttChannel extends Channel {
                                                     listeners.remove(correlationId);
                                                 }, callOptions.getExecutor());
                                             } else {
-                                                log.error("Failed to unmarshal protobuf message on topic {}", publish.getTopic());
+                                                if (Arrays.equals(NOT_IMPLEMENTED_PAYLOAD, publish.getPayloadAsBytes())) {
+                                                    log.error("Received method not implemented on topic {}", publish.getTopic());
+                                                } else {
+                                                    log.error("Failed to unmarshal protobuf message on topic {}", publish.getTopic());
+                                                }
                                             }
                                         } else {
                                             log.warn("Could not find a listener for message with correlation ID {}, ignoring", correlationId);
@@ -109,7 +113,7 @@ public class MqttChannel extends Channel {
                             .whenComplete((subAck, throwable) -> {
                                 if (throwable != null) {
                                     // Handle subscription failure
-                                    log.error("Failed to subscribe to topic {}", topic);
+                                    log.error("Failed to subscribe to topic {}", topicPrefix);
                                 }
                             });
                     registeredResponseTopics.add(methodResponseTopic);
@@ -144,7 +148,7 @@ public class MqttChannel extends Channel {
                     return;
                 }
                 mqttClient.toAsync().publishWith()
-                        .topic(methodTopic)
+                        .topic(methodQueryTopic)
                         .responseTopic(methodResponseTopic)
                         .correlationData(correlationId.getBytes(StandardCharsets.UTF_8))
                         .payload(payloadBuffer)
@@ -152,7 +156,7 @@ public class MqttChannel extends Channel {
                         .send()
                         .whenComplete((publish, throwable) -> {
                             if (throwable != null) {
-                                log.error("Failed to publish on topic {}", methodTopic);
+                                log.error("Failed to publish on topic {}", methodQueryTopic);
                                 // Handle publish failure
                             }
                         });
@@ -162,17 +166,22 @@ public class MqttChannel extends Channel {
 
     public static class Builder {
         private final MqttClientBuilder clientBuilder;
+
+        private boolean pingService;
+        private int pingDeadlineSeconds;
         private int port;
 
         private String brokerUrl;
+        private String topicPrefix;
+
+        private String clientId;
         private Builder() {
             clientBuilder = MqttClient.builder();
+            pingService = true;
+            pingDeadlineSeconds = 30;
         }
-        private String clientId;
-        private String topic;
 
-
-        public Builder brokerUrl(String brokerUrl) {
+        public Builder brokerAddress(String brokerUrl) {
             this.brokerUrl = brokerUrl;
             return this;
         }
@@ -182,8 +191,19 @@ public class MqttChannel extends Channel {
             return this;
         }
 
-        public Builder topic(String topic) {
-            this.topic = topic;
+        public Builder topicPrefix(String topicPrefix) {
+            this.topicPrefix = topicPrefix;
+            return this;
+        }
+
+        // Whether the topic prefix should be checked whether it has a MqttServer which will respond
+        public Builder pingService(boolean pingService) {
+            this.pingService = pingService;
+            return this;
+        }
+
+        public Builder setPingDeadlineSeconds(int pingDeadlineSeconds) {
+            this.pingDeadlineSeconds = pingDeadlineSeconds;
             return this;
         }
 
@@ -210,10 +230,51 @@ public class MqttChannel extends Channel {
 
             mqttClient.connect().join();
 
-            if (topic == null || topic.isBlank()) {
+            // Optionally, verify there's _some_ backend service that will respond
+            // (does not check any implemented methods, just an initial check to ensure we don't publish into nothingness)
+            pingService(mqttClient);
+
+            if (topicPrefix == null || topicPrefix.isBlank()) {
                 throw new IllegalStateException("topic must not be empty");
             }
-            return new MqttChannel(mqttClient, topic, clientId);
+            return new MqttChannel(mqttClient, topicPrefix, clientId);
+        }
+
+        private void pingService(Mqtt5AsyncClient mqttClient) {
+            if (pingService) {
+                final String pingResponseTopic = topicPrefix + RESPONSES_INFIX + clientId + "/ping";
+                final CountDownLatch latch = new CountDownLatch(1);
+                final Mqtt5SubAck suback = mqttClient.subscribeWith()
+                        .topicFilter(pingResponseTopic)
+                        .qos(MqttQos.AT_LEAST_ONCE)
+                        .callback(mqtt5Publish -> {
+                            latch.countDown();
+                        })
+                        .send().join();
+                if (suback.getReasonCodes().stream().anyMatch(Mqtt5ReasonCode::isError)) {
+                    log.error("Failed to subscribe to ping response topic, suback: {}", suback);
+                    throw new IllegalStateException("Failed to subscribe to ping response topic");
+                }
+                final Mqtt5PublishResult publishResult = mqttClient.toBlocking()
+                        .publishWith()
+                        .topic(topicPrefix + PING_SUFFIX)
+                        .payload("ping".getBytes())
+                        .responseTopic(pingResponseTopic)
+                        .send();
+                if (publishResult.getError().isPresent()) {
+                    log.error("Failed to publish ping to backend service", publishResult.getError().get());
+                    throw new IllegalStateException("Could not ping backend service");
+                }
+                try {
+                    final boolean reached = latch.await(pingDeadlineSeconds, TimeUnit.SECONDS);
+                    if (!reached) {
+                        throw new IllegalStateException("Failed to ping service in " + pingDeadlineSeconds + "s");
+                    }
+                    log.debug("Backend service is present, proceeding");
+                } catch (InterruptedException e) {
+                    throw new IllegalStateException("Interrupted while pinging service");
+                }
+            }
         }
     }
 }

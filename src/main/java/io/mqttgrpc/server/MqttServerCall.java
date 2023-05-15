@@ -1,4 +1,4 @@
-package server;
+package io.mqttgrpc.server;
 
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.datatypes.MqttTopic;

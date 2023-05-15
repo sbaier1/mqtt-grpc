@@ -1,9 +1,10 @@
-import client.MqttChannel;
 import com.hivemq.client.mqtt.MqttClient;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient;
 import com.hivemq.testcontainer.core.HiveMQTestContainerCore;
 import io.grpc.stub.StreamObserver;
+import io.mqttgrpc.client.MqttChannel;
+import io.mqttgrpc.server.MqttServer;
 import org.example.grpc.PingRequest;
 import org.example.grpc.PingResponse;
 import org.example.grpc.PingServiceGrpc;
@@ -15,7 +16,6 @@ import org.testcontainers.containers.Network;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
-import server.MqttServer;
 
 import java.io.IOException;
 
@@ -42,25 +42,25 @@ public class MqttGrpcIntegrationTest {
         // Start the MQTT server
         String brokerUrl = "localhost";
         final Integer mqttPort = mqttBroker.getMappedPort(MQTT_PORT);
+        final String topicPrefix = "grpc/server";
 
         setupObserverClient(mqttPort);
         System.out.println("MQTT port " + mqttPort);
-        mqttServer = MqttServer.newBuilder()
+        mqttServer = MqttServer.builder()
                 .clientId("server")
+                .topicPrefix(topicPrefix)
                 .brokerAddress(brokerUrl)
-                .setBrokerPort(mqttPort)
-                //("grpc/server/ping.PingService/Ping")
-                //("grpc/client/ping.PingService/Ping")
+                .port(mqttPort)
                 .addService(getMockImpl())
                 .build();
         mqttServer.start();
 
         // Create the gRPC channel using the MqttChannel implementation
         mqttChannel = MqttChannel.builder()
-                .brokerUrl(brokerUrl)
-                .port(mqttPort)
                 .clientId("client")
-                .topic("grpc/server/")
+                .topicPrefix(topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
                 .build();
         client = PingServiceGrpc.newBlockingStub(mqttChannel);
     }
