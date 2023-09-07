@@ -42,6 +42,8 @@ public class MqttChannel extends Channel {
     private final MqttQos qos;
     private final ScheduledExecutorService timeoutExecutor;
 
+    private final Set<String> topicPrefixes;
+
     MqttChannel(Mqtt5AsyncClient mqttClient,
                 String topicPrefix,
                 String clientId,
@@ -53,6 +55,7 @@ public class MqttChannel extends Channel {
         this.timeoutSeconds = timeoutSeconds;
         this.qos = qos;
         this.timeoutExecutor = Executors.newSingleThreadScheduledExecutor();
+        this.topicPrefixes = new HashSet<>();
         registeredResponseTopics = Collections.synchronizedSet(new HashSet<>());
         contexts = new ConcurrentHashMap<>();
         if (interceptors.size() > 0) {
@@ -60,6 +63,7 @@ public class MqttChannel extends Channel {
         } else {
             actualChannel = new ActualMqttChannel(topicPrefix);
         }
+        topicPrefixes.add(topicPrefix);
         timeoutTasks = new ConcurrentHashMap<>();
     }
 
@@ -73,6 +77,10 @@ public class MqttChannel extends Channel {
         if (topicPrefix == null || topicPrefix.isBlank()) {
             throw new IllegalStateException("topic prefix must not be blank");
         }
+        if (topicPrefixes.contains(topicPrefix)) {
+            throw new IllegalStateException("topic prefix " + topicPrefix + " is already in use, topic prefixes must be unique");
+        }
+        topicPrefixes.add(topicPrefix);
         return new ActualMqttChannel(topicPrefix);
     }
 
