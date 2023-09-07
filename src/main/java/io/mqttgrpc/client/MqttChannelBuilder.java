@@ -4,6 +4,7 @@ import com.hivemq.client.mqtt.MqttClient;
 import com.hivemq.client.mqtt.MqttClientBuilder;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient;
+import com.hivemq.client.mqtt.mqtt5.Mqtt5Client;
 import com.hivemq.client.mqtt.mqtt5.message.Mqtt5ReasonCode;
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5PublishResult;
 import com.hivemq.client.mqtt.mqtt5.message.subscribe.suback.Mqtt5SubAck;
@@ -37,6 +38,10 @@ public class MqttChannelBuilder {
     private String clientId;
     private MqttQos qos;
 
+    private Mqtt5Client client;
+
+    private boolean useExistingClient;
+
     MqttChannelBuilder() {
         clientBuilder = MqttClient.builder();
         pingService = true;
@@ -44,6 +49,8 @@ public class MqttChannelBuilder {
         timeout = 30;
         qos = MqttQos.AT_LEAST_ONCE;
         interceptors = new ArrayList<>();
+        useExistingClient = false;
+        client = null;
     }
 
     public MqttChannelBuilder brokerAddress(String brokerUrl) {
@@ -77,6 +84,12 @@ public class MqttChannelBuilder {
         return this;
     }
 
+    public MqttChannelBuilder setClient(Mqtt5Client client) {
+        this.client = client;
+        this.useExistingClient = true;
+        return this;
+    }
+
     public MqttChannelBuilder intercept(ClientInterceptor... interceptor) {
         this.interceptors.addAll(List.of(interceptor));
         return this;
@@ -104,23 +117,29 @@ public class MqttChannelBuilder {
     }
 
     public MqttChannel build() {
-        Mqtt5AsyncClient mqttClient = clientBuilder
-                .identifier(clientId)
-                .serverHost(brokerUrl)
-                .serverPort(port)
-                .useMqttVersion5()
-                .buildAsync();
 
-        mqttClient.connect().join();
+        if (!useExistingClient) {
+            this.client = clientBuilder
+                    .identifier(clientId)
+                    .serverHost(brokerUrl)
+                    .serverPort(port)
+                    .useMqttVersion5()
+                    .buildAsync();
+            client.toAsync().connect().join();
+        }
 
         // Optionally, verify there's _some_ backend service that will respond
         // (does not check any implemented methods, just an initial check to ensure we don't publish into nothingness)
-        pingService(mqttClient);
+        pingService(client.toAsync());
+
+        if (clientId == null || clientId.isBlank()) {
+            throw new IllegalStateException("client id must not be empty");
+        }
 
         if (topicPrefix == null || topicPrefix.isBlank()) {
             throw new IllegalStateException("topic must not be empty");
         }
-        return new MqttChannel(mqttClient, topicPrefix, clientId, interceptors, timeout, qos);
+        return new MqttChannel(client.toAsync(), topicPrefix, clientId, interceptors, timeout, qos);
     }
 
     private void pingService(Mqtt5AsyncClient mqttClient) {

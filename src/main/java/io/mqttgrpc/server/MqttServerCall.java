@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 
 
@@ -76,11 +77,15 @@ public class MqttServerCall<ReqT, RespT> extends ServerCall<ReqT, RespT> {
             //MqttMessage responseMessage = new MqttMessage(responseTopic, MqttQos.AT_LEAST_ONCE, responsePayload);
             final MqttTopic responseTopic = responseTopicOptional.get();
             final Optional<ByteBuffer> correlationData = publish.getCorrelationData();
+            byte[] correlationBytes = new byte[correlationData.get().remaining()];
+            correlationData.get().get(correlationBytes);
+            String correlationId = new String(correlationBytes, StandardCharsets.UTF_8);
+            log.debug("Responding to gRPC call on method {}, topic {}, correlation ID {}", methodDescriptor.getFullMethodName(), responseTopic, correlationId);
             mqttClient.toAsync().publishWith()
                     .topic(responseTopic)
                     .qos(qos)
                     .payload(responsePayload)
-                    .correlationData(correlationData.orElse(null))
+                    .correlationData(ByteBuffer.wrap(correlationBytes))
                     .send()
                     .whenComplete((mqtt5PublishResult, throwable) -> {
                         if (throwable != null) {

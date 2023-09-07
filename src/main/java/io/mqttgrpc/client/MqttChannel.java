@@ -31,11 +31,11 @@ public class MqttChannel extends Channel {
     private final String clientId;
     private final int timeoutSeconds;
 
-    private final List<String> registeredResponseTopics;
+    private final Set<String> registeredResponseTopics;
 
 
-    // gRPC method -> correlation-id -> listener
-    private final Map<String, Map<String, ClientCall.Listener<?>>> listeners;
+    // gRPC method -> correlation-id -> call context
+    private final Map<String, Map<String, CallContext>> contexts;
 
     // Dumb initial timeout handling: store some scheduled futures, cancel them when the response arrives.
     private final Map<String, ScheduledFuture<?>> timeoutTasks;
@@ -55,8 +55,8 @@ public class MqttChannel extends Channel {
         this.timeoutSeconds = timeoutSeconds;
         this.qos = qos;
         this.timeoutExecutor = Executors.newSingleThreadScheduledExecutor();
-        registeredResponseTopics = new CopyOnWriteArrayList<>();
-        listeners = new ConcurrentHashMap<>();
+        registeredResponseTopics = Collections.synchronizedSet(new HashSet<>());
+        contexts = new ConcurrentHashMap<>();
         if (interceptors.size() > 0) {
             actualChannel = ClientInterceptors.intercept(new ActualMqttChannel(), interceptors);
         } else {
@@ -90,6 +90,61 @@ public class MqttChannel extends Channel {
         this.mqttClient.disconnect();
     }
 
+    // Tracks all necessary context for a single gRPC unary call
+    private static final class CallContext {
+        private ClientCall.Listener<?> listener;
+        private CallOptions callOptions;
+        private Metadata headers;
+
+        public ClientCall.Listener<?> listener() {
+            return listener;
+        }
+
+        public CallOptions callOptions() {
+            return callOptions;
+        }
+
+        public CallContext setCallOptions(CallOptions callOptions) {
+            this.callOptions = callOptions;
+            return this;
+        }
+
+        public void setListener(ClientCall.Listener<?> listener) {
+            this.listener = listener;
+        }
+
+        public CallContext setHeaders(Metadata headers) {
+            this.headers = headers;
+            return this;
+        }
+
+        public Metadata headers() {
+            return headers;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (obj == this) return true;
+            if (obj == null || obj.getClass() != this.getClass()) return false;
+            var that = (CallContext) obj;
+            return Objects.equals(this.listener, that.listener) &&
+                    Objects.equals(this.callOptions, that.callOptions) &&
+                    Objects.equals(this.headers, that.headers);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(listener, callOptions, headers);
+        }
+
+        @Override
+        public String toString() {
+            return "CallContext[" +
+                    "listener=" + listener + ", " +
+                    "callOptions=" + callOptions + ", " +
+                    "headers=" + headers + ']';
+        }
+    }
 
     public final class ActualMqttChannel extends Channel {
 
@@ -104,157 +159,190 @@ public class MqttChannel extends Channel {
             String correlationId = UUID.randomUUID().toString();
             final String methodName = method.getFullMethodName();
             final String methodQueryTopic = topicPrefix + ENDPOINTS_INFIX + methodName;
-            final String methodResponseTopic = topicPrefix + RESPONSES_INFIX + clientId + methodName;
+            final String methodResponseTopic = topicPrefix + RESPONSES_INFIX + clientId + "/" + methodName;
+            log.debug("Starting call on method {} with correlation id {}", methodName, correlationId);
 
-            return new ClientCall<>() {
-                private Listener<RespT> callListener;
+            final Map<String, CallContext> methodContexts = contexts.computeIfAbsent(methodName, s -> new ConcurrentHashMap<>());
+            methodContexts.put(correlationId, new CallContext().setCallOptions(callOptions));
+            return new InternalClientCall<>(methodName, correlationId, methodResponseTopic, method, methodQueryTopic);
+        }
 
-                @Override
-                public void start(Listener<RespT> responseListener, Metadata headers) {
-                    this.callListener = responseListener;
-                    listeners.computeIfAbsent(methodName, s -> {
-                        final ConcurrentHashMap<String, Listener<?>> correlationIdToListenersMap = new ConcurrentHashMap<>();
-                        correlationIdToListenersMap.put(correlationId, callListener);
-                        return correlationIdToListenersMap;
-                    });
+        private <ReqT, RespT> Consumer<Mqtt5Publish> methodCallback(String methodName, MethodDescriptor<ReqT, RespT> method) {
+            return publish -> {
+                try {
+                    final Optional<ByteBuffer> correlationData = publish.getCorrelationData();
+                    if (correlationData.isEmpty()) {
+                        log.warn("No correlation data found in PUBLISH on topic {}, ignoring", publish.getTopic());
+                    } else {
+                        byte[] correlationBytes = new byte[correlationData.get().remaining()];
+                        correlationData.get().get(correlationBytes);
+                        String correlationId = new String(correlationBytes, StandardCharsets.UTF_8);
+                        final Map<String, CallContext> contextsForMethod = contexts.get(methodName);
+                        if (contextsForMethod.containsKey(correlationId)) {
+                            InputStream payloadStream = new ByteArrayInputStream(publish.getPayloadAsBytes());
+                            Object response = method.getResponseMarshaller().parse(payloadStream);
+                            if (response != null) {
+                                final CallContext context = contextsForMethod.get(correlationId);
+                                final ClientCall.Listener<?> listener = context.listener;
+                                final CallOptions callOptions = context.callOptions;
+                                final Metadata headers = context.headers();
+                                // Ensure we notify listener in the caller's executor
+                                CompletableFuture.runAsync(() -> {
+                                    try {
+                                        // Stop timeout task
+                                        if (timeoutTasks.containsKey(correlationId)) {
+                                            timeoutTasks.get(correlationId).cancel(true);
+                                            timeoutTasks.remove(correlationId);
+                                        }
+                                        listener.onHeaders(headers);
+                                        castListener(listener).onMessage(response);
+                                        listener.onReady();
+                                        listener.onClose(Status.OK, new Metadata());
+                                        // Handled, remove again
+                                        contextsForMethod.remove(correlationId);
+                                        log.debug("Successfully finished gRPC call on method {} for correlation ID {}", methodName, correlationId);
+                                    } catch (Exception ex) {
+                                        log.error("Failed to notify caller, method {}, correlation ID {}", methodName, correlationId, ex);
+                                    }
+                                }, callOptions.getExecutor());
+                            } else {
+                                if (Arrays.equals(NOT_IMPLEMENTED_PAYLOAD, publish.getPayloadAsBytes())) {
+                                    log.error("Received method not implemented on method {} for correlation ID {} on topic {}", methodName, correlationId, publish.getTopic());
+                                    if (contextsForMethod.containsKey(correlationId)) {
+                                        contextsForMethod.get(correlationId).listener().onClose(Status.UNIMPLEMENTED, new Metadata());
+                                        contextsForMethod.remove(correlationId);
+                                    }
+                                } else {
+                                    log.error("Failed to unmarshal protobuf message on method {} for correlation ID {} on topic {}", methodName, correlationId, publish.getTopic());
+                                    if (contextsForMethod.containsKey(correlationId)) {
+                                        contextsForMethod.get(correlationId).listener().onClose(Status.INTERNAL, new Metadata());
+                                        contextsForMethod.remove(correlationId);
+                                    }
+                                }
+                            }
+                        } else {
+                            log.warn("Could not find a listener for message with correlation ID {} on method {}, ignoring. Received on topic {}", correlationId, methodName, publish.getTopic());
+                        }
+                    }
+                } catch (Exception ex) {
+                    log.error("Unexpected error in response callback", ex);
+                }
+            };
+        }
+
+        private class InternalClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
+            private final String methodName;
+            private final String correlationId;
+            private final String methodResponseTopic;
+            private final MethodDescriptor<ReqT, RespT> method;
+            private final String methodQueryTopic;
+            private Listener<RespT> callListener;
+
+            public InternalClientCall(String methodName, String correlationId, String methodResponseTopic, MethodDescriptor<ReqT, RespT> method, String methodQueryTopic) {
+                this.methodName = methodName;
+                this.correlationId = correlationId;
+                this.methodResponseTopic = methodResponseTopic;
+                this.method = method;
+                this.methodQueryTopic = methodQueryTopic;
+            }
+
+            @Override
+            public void start(Listener<RespT> responseListener, Metadata headers) {
+                this.callListener = responseListener;
+                final Map<String, CallContext> correlationContexts = contexts.get(methodName);
+                correlationContexts.get(correlationId)
+                        .setHeaders(headers)
+                        .setListener(responseListener);
+                synchronized (registeredResponseTopics) {
                     if (!registeredResponseTopics.contains(methodResponseTopic)) {
+                        log.debug("Subscribing to topic {}", methodResponseTopic);
                         mqttClient.subscribeWith()
                                 .topicFilter(methodResponseTopic)
                                 .qos(qos)
-                                .callback(methodCallback(headers))
+                                .callback(methodCallback(methodName, method))
                                 .send()
                                 .whenComplete((subAck, throwable) -> {
                                     if (throwable != null) {
                                         // Handle subscription failure
                                         log.error("Failed to subscribe to topic {}", topicPrefix);
                                     }
-                                });
+                                })
+                                .join();
                         registeredResponseTopics.add(methodResponseTopic);
                     }
                 }
+            }
 
-                private Consumer<Mqtt5Publish> methodCallback(Metadata headers) {
-                    return publish -> {
-                        try {
-                            final Optional<ByteBuffer> correlationData = publish.getCorrelationData();
-                            if (correlationData.isEmpty()) {
-                                log.warn("No correlation data found in PUBLISH on topic {}, ignoring", publish.getTopic());
-                            } else {
-                                byte[] correlationBytes = new byte[correlationData.get().remaining()];
-                                correlationData.get().get(correlationBytes);
-                                String correlationId = new String(correlationBytes, StandardCharsets.UTF_8);
-                                final Map<String, Listener<?>> listenersForMethod = listeners.get(methodName);
-                                if (listenersForMethod.containsKey(correlationId)) {
-                                    InputStream payloadStream = new ByteArrayInputStream(publish.getPayloadAsBytes());
-                                    Object response = method.getResponseMarshaller().parse(payloadStream);
-                                    if (response != null) {
-                                        final Listener<?> listener = listenersForMethod.get(correlationId);
-                                        // Ensure we notify listener in the caller's executor
-                                        CompletableFuture.runAsync(() -> {
-                                            // Stop timeout task
-                                            if (timeoutTasks.containsKey(correlationId)) {
-                                                timeoutTasks.get(correlationId).cancel(true);
-                                                timeoutTasks.remove(correlationId);
-                                            }
-                                            listener.onHeaders(headers);
-                                            castListener(listener).onMessage(response);
-                                            listener.onReady();
-                                            listener.onClose(Status.OK, new Metadata());
-                                            // Handled, remove again
-                                            listenersForMethod.remove(correlationId);
-                                        }, callOptions.getExecutor());
-                                    } else {
-                                        if (Arrays.equals(NOT_IMPLEMENTED_PAYLOAD, publish.getPayloadAsBytes())) {
-                                            log.error("Received method not implemented on topic {}", publish.getTopic());
-                                            if (listenersForMethod.containsKey(correlationId)) {
-                                                listenersForMethod.get(correlationId).onClose(Status.UNIMPLEMENTED, new Metadata());
-                                                listenersForMethod.remove(correlationId);
-                                            }
-                                        } else {
-                                            log.error("Failed to unmarshal protobuf message on topic {}", publish.getTopic());
-                                            if (listenersForMethod.containsKey(correlationId)) {
-                                                listenersForMethod.get(correlationId).onClose(Status.INTERNAL, new Metadata());
-                                                listenersForMethod.remove(correlationId);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    log.warn("Could not find a listener for message with correlation ID {} on method {}, ignoring. Received on topic {}", correlationId, methodName, publish.getTopic());
-                                }
-                            }
-                        } catch (Exception ex) {
-                            log.error("Unexpected error in response callback", ex);
-                        }
-                    };
+            @Override
+            public void request(int numMessages) {
+                // No-op
+            }
+
+            @Override
+            public void cancel(String message, Throwable cause) {
+                log.error("Canceling call. message {} cause", message, cause);
+                callListener.onClose(Status.CANCELLED, new Metadata());
+            }
+
+            @Override
+            public void halfClose() {
+                // No-op
+            }
+
+            @Override
+            public void sendMessage(ReqT message) {
+                // Serialize the message using the method's marshaller
+                final ByteBuffer payloadBuffer;
+                try (InputStream serializedMessageStream = method.getRequestMarshaller().stream(message)) {
+                    payloadBuffer = ByteBuffer.wrap(serializedMessageStream.readAllBytes());
+                } catch (IOException e) {
+                    log.error("Failed to serialize request", e);
+                    return;
                 }
-
-                @Override
-                public void request(int numMessages) {
-                    // No-op
-                }
-
-                @Override
-                public void cancel(String message, Throwable cause) {
-                    log.error("Canceling call. message {} cause", message, cause);
-                    callListener.onClose(Status.CANCELLED, new Metadata());
-                    mqttClient.disconnect();
-                }
-
-                @Override
-                public void halfClose() {
-                    // No-op
-                }
-
-                @Override
-                public void sendMessage(ReqT message) {
-                    // Serialize the message using the method's marshaller
-                    InputStream serializedMessageStream = method.getRequestMarshaller().stream(message);
-                    final ByteBuffer payloadBuffer;
-                    try {
-                        payloadBuffer = ByteBuffer.wrap(serializedMessageStream.readAllBytes());
-                    } catch (IOException e) {
-                        log.error("Failed to serialize request", e);
-                        return;
-                    }
-                    final CompletableFuture<Mqtt5PublishResult> sendFuture = mqttClient.toAsync().publishWith()
-                            .topic(methodQueryTopic)
-                            .responseTopic(methodResponseTopic)
-                            .correlationData(correlationId.getBytes(StandardCharsets.UTF_8))
-                            .payload(payloadBuffer)
-                            .qos(qos)
-                            .send();
-                    // Timeout handling
-                    sendFuture.thenRunAsync(() -> {
-                        if (callOptions.getDeadline() != null) {
+                final CompletableFuture<Mqtt5PublishResult> sendFuture = mqttClient.toAsync().publishWith()
+                        .topic(methodQueryTopic)
+                        .responseTopic(methodResponseTopic)
+                        .correlationData(correlationId.getBytes(StandardCharsets.UTF_8))
+                        .payload(payloadBuffer)
+                        .qos(qos)
+                        .send();
+                // Timeout handling
+                sendFuture.thenRunAsync(() -> {
+                    final Map<String, CallContext> correlationContexts = contexts.get(methodName);
+                    final CallContext callContext = correlationContexts.get(correlationId);
+                    if (callContext != null) {
+                        if (callContext.callOptions().getDeadline() != null) {
                             // Deadline set by client, use that instead of the global timeout
-                            callOptions.getDeadline().runOnExpiration(getTimeoutTask(), timeoutExecutor);
+                            callContext.callOptions().getDeadline().runOnExpiration(getTimeoutTask(), timeoutExecutor);
                         } else {
                             timeoutTasks.put(correlationId, timeoutExecutor.schedule(getTimeoutTask(), timeoutSeconds, TimeUnit.SECONDS));
                         }
-                    });
-                    sendFuture
-                            .whenComplete((publish, throwable) -> {
-                                if (throwable != null) {
-                                    log.error("Failed to publish on topic {}", methodQueryTopic);
-                                    // Handle publish failure
-                                }
-                            });
-                }
+                    }
+                });
+                sendFuture
+                        .whenComplete((publish, throwable) -> {
+                            if (throwable != null) {
+                                log.error("Failed to publish on topic {}", methodQueryTopic);
+                                // Handle publish failure
+                            }
+                        })
+                        .join();
+            }
 
-                private Runnable getTimeoutTask() {
-                    return () -> {
-                        log.warn("Request to method {} for correlation id {} timed out", method.getFullMethodName(), correlationId);
-                        final Map<String, Listener<?>> correlationIdToListeners = listeners.get(method.getFullMethodName());
-                        CompletableFuture.runAsync(() -> {
-                                    final Listener<?> listener = correlationIdToListeners.get(correlationId);
-                                    listener.onClose(Status.CANCELLED, new Metadata());
-                                    System.out.println(listener);
-                                }, callOptions.getExecutor())
-                                .join();
-                        correlationIdToListeners.remove(correlationId);
-                    };
-                }
-            };
+            private Runnable getTimeoutTask() {
+                return () -> {
+                    final Map<String, CallContext> correlationContexts = contexts.get(method.getFullMethodName());
+                    final CallContext callContext = correlationContexts.get(correlationId);
+                    log.warn("Request to method {} for correlation id {} timed out", method.getFullMethodName(), correlationId);
+                    CompletableFuture.runAsync(() -> {
+                                final Listener<?> listener = callContext.listener;
+                                log.debug("timed out, notifying listener {} for correlation id {}", listener, correlationId);
+                                listener.onClose(Status.CANCELLED, new Metadata());
+                            }, callContext.callOptions().getExecutor())
+                            .join();
+                    correlationContexts.remove(correlationId);
+                };
+            }
         }
     }
 }
