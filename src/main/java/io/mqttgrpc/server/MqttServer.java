@@ -1,17 +1,26 @@
 package io.mqttgrpc.server;
 
+import com.hivemq.client.mqtt.MqttGlobalPublishFilter;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
+import com.hivemq.client.mqtt.datatypes.MqttTopic;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5Client;
+import com.hivemq.client.mqtt.mqtt5.Mqtt5RxClient;
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish;
+import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5PublishBuilder;
+import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5PublishResult;
 import io.grpc.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static io.mqttgrpc.Constants.ENDPOINTS_INFIX;
+import static io.mqttgrpc.Constants.NOT_IMPLEMENTED_PAYLOAD;
 
 /**
  * A gRPC Server implementation that uses MQTT5 as its transport protocol
@@ -25,119 +34,138 @@ public class MqttServer {
     private final List<ServerInterceptor> interceptors;
     private final String topicPrefix;
     private final MqttQos qos;
+    private final boolean respondNotImplemented;
+    private final String topicPrefixWithoutSharedGroup;
 
 
     public MqttServer(final Mqtt5Client mqttClient,
                       final List<BindableService> services,
                       final List<ServerInterceptor> interceptors,
                       final String topicPrefix,
-                      final MqttQos qos) {
+                      final MqttQos qos, boolean respondNotImplemented) {
         this.mqttClient = mqttClient;
         this.services = services;
         this.interceptors = interceptors;
         this.topicPrefix = topicPrefix;
         this.qos = qos;
+        this.respondNotImplemented = respondNotImplemented;
+        // Remove shared group prefix if any (it's not present in received publishes)
+        topicPrefixWithoutSharedGroup = topicPrefix
+                .replaceAll("^\\$share/[^/]+/", "");
     }
 
     public static MqttServerBuilder builder() {
         return new MqttServerBuilder();
     }
 
-    public CompletableFuture<Void> start() {
-        return CompletableFuture.runAsync(() -> {
-            for (BindableService service : services) {
-                ServerServiceDefinition serviceDefinition = service.bindService();
-                for (ServerMethodDefinition<?, ?> methodDefinition : serviceDefinition.getMethods()) {
-                    String methodName = methodDefinition.getMethodDescriptor().getFullMethodName();
-                    String topicFilter = topicPrefix + ENDPOINTS_INFIX + methodName;
-                    final MqttMessageHandler handler = new MqttMessageHandler(mqttClient, serviceDefinition, this.interceptors, topicPrefix, qos);
-                    // TODO: Callback probably doesn't perform well at scale
-                    mqttClient.toAsync().subscribeWith()
-                            .topicFilter(topicFilter)
-                            .qos(qos)
-                            .callback(handler::onMqttMessageReceived)
-                            .send()
-                            .whenComplete((subAck, throwable) -> {
-                                if (throwable != null) {
-                                    log.error("Failed to subscribe to topic: {}", topicFilter);
-                                } else {
-                                    log.debug("Successfully subscribed to topic: {}", topicFilter);
-                                }
-                            });
-                }
+
+    public void start() {
+        mqttClient.toAsync().subscribeWith()
+                .topicFilter(topicPrefix + ENDPOINTS_INFIX + "#")
+                .qos(qos)
+                .send()
+                .join();
+
+        final Mqtt5RxClient rx = mqttClient.toRx();
+        rx.publishes(MqttGlobalPublishFilter.ALL)
+                .subscribe(this::onMqttMessageReceived);
+    }
+
+    private void onMqttMessageReceived(Mqtt5Publish publish) {
+        if (!publish.getTopic().toString().startsWith(topicPrefixWithoutSharedGroup + ENDPOINTS_INFIX)) {
+            log.trace("Ignoring publish on topic {} as it doesn't match the endpoint prefix.", publish.getTopic());
+            return;
+        }
+        String methodName = getMethodNameFromPublish(publish);
+        if (methodName == null) {
+            log.warn("Could not find method name for topic {}, ignoring request.", publish.getTopic());
+            return;
+        }
+        ServerServiceDefinition serviceDefinition = lookupServiceDefinitionForMethod(methodName);
+        if (serviceDefinition == null) {
+            log.error("Could not find service definition for method {}. Cannot handle request. Original topic {}", methodName, publish.getTopic());
+            respondNotImplemented(publish);
+            return;
+        }
+        ServerMethodDefinition<?, ?> methodDefinition = serviceDefinition.getMethod(methodName);
+        if (methodDefinition == null) {
+            log.error("Could not find method definition for method {}. Cannot handle request. Original topic {}", methodName, publish.getTopic());
+            respondNotImplemented(publish);
+            return;
+        }
+        Metadata headers = new Metadata(); // Additional logic can be added to extract headers from MQTT message if needed
+        dispatchMessage(publish, methodDefinition, headers);
+    }
+
+    private void respondNotImplemented(Mqtt5Publish publish) {
+        final Optional<MqttTopic> topic = publish.getResponseTopic();
+        if (respondNotImplemented && topic.isPresent()) {
+            final Mqtt5PublishBuilder.Send.Complete<CompletableFuture<Mqtt5PublishResult>> publishBuilder = mqttClient.toAsync()
+                    .publishWith()
+                    .topic(topic.get())
+                    .qos(qos)
+                    .payload(NOT_IMPLEMENTED_PAYLOAD);
+            //noinspection ResultOfMethodCallIgnored
+            publish.getCorrelationData().ifPresent(byteBuffer -> publishBuilder.correlationData(publish.getCorrelationData().get()));
+            publishBuilder.send();
+            log.debug("Sent a NOT_IMPLEMENTED response on topic {}", topic);
+        } else {
+            log.debug("No response topic present in unhandled PUBLISH on topic {}", publish.getTopic());
+        }
+    }
+
+
+    private ServerServiceDefinition lookupServiceDefinitionForMethod(String methodName) {
+        for (BindableService service : services) {
+            ServerServiceDefinition serviceDefinition = service.bindService();
+            if (serviceDefinition.getMethod(methodName) != null) {
+                return serviceDefinition;
             }
-        });
+        }
+        return null;
     }
 
     public void stop() {
         mqttClient.toAsync().disconnect();
     }
 
-    public static class MqttMessageHandler {
-        private final Mqtt5Client mqttClient1;
-        private final ServerServiceDefinition registry;
-        private final List<ServerInterceptor> interceptors;
-        private final String topicPrefix1;
-        private final MqttQos qos1;
-
-        public MqttMessageHandler(final Mqtt5Client mqttClient,
-                                  final ServerServiceDefinition registry,
-                                  final List<ServerInterceptor> interceptors,
-                                  final String topicPrefix,
-                                  final MqttQos qos) {
-            mqttClient1 = mqttClient;
-            this.registry = registry;
-            this.interceptors = interceptors;
-            topicPrefix1 = topicPrefix;
-            qos1 = qos;
-        }
-
-        public void onMqttMessageReceived(Mqtt5Publish publish) {
-            String methodName = getMethodNameFromPublish(topicPrefix1, publish);
-            Metadata headers = new Metadata(); // You might need to extract headers from the MQTT message
-
-            ServerMethodDefinition<?, ?> methodDefinition = registry.getMethod(methodName);
-            if (methodDefinition == null) {
-                // Handle method not found
-                // You might want to send an MQTT message with an appropriate error status
-                log.error("Could not find method for inferred method name {}. Cannot handle request. Original topic name: {}", methodName, publish.getTopic());
-                // Try ensuring that the callback fails, so we don't ack the PUBLISH. TBD if this works at all. something like this could be useful though. not sure.
-                throw new IllegalStateException("Failed to handle request on method " + methodName);
-            }
-
-            dispatchMessage(publish, methodDefinition, headers);
-        }
-
-        private String getMethodNameFromPublish(String topicPrefix, Mqtt5Publish publish) {
-            String topic = publish.getTopic().toString();
-            // Remove shared group prefix if any (it's not present in received publishes)
-            final String topicPrefixWithoutSharedGroup = topicPrefix
-                    .replaceAll("^\\$share/[^/]+/", "");
+    private String getMethodNameFromPublish(Mqtt5Publish publish) {
+        String topic = publish.getTopic().toString();
+        final int prefixEndpointLength = (topicPrefixWithoutSharedGroup + ENDPOINTS_INFIX).length();
+        if (prefixEndpointLength < topic.length()) {
             return topic
-                    .substring((topicPrefixWithoutSharedGroup + ENDPOINTS_INFIX).length());
+                    .substring(prefixEndpointLength);
+        } else {
+            return null;
+        }
+    }
+
+    private <ReqT, RespT> void dispatchMessage(Mqtt5Publish publish, ServerMethodDefinition<ReqT, RespT> methodDefinition, Metadata headers) {
+        MethodDescriptor<ReqT, RespT> methodDescriptor = methodDefinition.getMethodDescriptor();
+        ReqT request;
+
+
+        final Optional<ByteBuffer> correlationData = publish.getCorrelationData();
+        byte[] correlationBytes = new byte[correlationData.get().remaining()];
+        correlationData.get().get(correlationBytes);
+        String correlationId = new String(correlationBytes, StandardCharsets.UTF_8);
+        log.debug("Invoking method {} for publish on topic {}, correlation id {}", methodDefinition.getMethodDescriptor().getFullMethodName(), publish.getTopic(), correlationId);
+
+        request = methodDescriptor.getRequestMarshaller().parse(new ByteArrayInputStream(publish.getPayloadAsBytes()));
+
+        ServerCallHandler<ReqT, RespT> callHandler = methodDefinition.getServerCallHandler();
+        for (ServerInterceptor interceptor : interceptors) {
+            callHandler = InternalServerInterceptors.interceptCallHandlerCreate(interceptor, callHandler);
         }
 
-        private <ReqT, RespT> void dispatchMessage(Mqtt5Publish publish, ServerMethodDefinition<ReqT, RespT> methodDefinition, Metadata headers) {
-            MethodDescriptor<ReqT, RespT> methodDescriptor = methodDefinition.getMethodDescriptor();
-            ReqT request;
+        // Implement a custom ServerCall for MQTT
+        MqttServerCall<ReqT, RespT> serverCall = new MqttServerCall<>(mqttClient, publish, methodDescriptor, qos);
+        ServerCall.Listener<ReqT> listener = callHandler.startCall(serverCall, headers);
 
-            request = methodDescriptor.getRequestMarshaller().parse(new ByteArrayInputStream(publish.getPayloadAsBytes()));
-
-            ServerCallHandler<ReqT, RespT> callHandler = methodDefinition.getServerCallHandler();
-            for (ServerInterceptor interceptor : interceptors) {
-                callHandler = InternalServerInterceptors.interceptCallHandlerCreate(interceptor, callHandler);
-            }
-            // TODO: is something missing here to invoke the actual impl method? not sure
-
-            // Implement a custom ServerCall for MQTT
-            MqttServerCall<ReqT, RespT> serverCall = new MqttServerCall<>(mqttClient1, publish, methodDescriptor, qos1);
-            ServerCall.Listener<ReqT> listener = callHandler.startCall(serverCall, headers);
-
-            // If the call is unary or server-streaming, you can handle it directly here
-            if (methodDescriptor.getType() == MethodDescriptor.MethodType.UNARY || methodDescriptor.getType() == MethodDescriptor.MethodType.SERVER_STREAMING) {
-                listener.onMessage(request);
-                listener.onHalfClose();
-            }
+        // If the call is unary or server-streaming, you can handle it directly here
+        if (methodDescriptor.getType() == MethodDescriptor.MethodType.UNARY || methodDescriptor.getType() == MethodDescriptor.MethodType.SERVER_STREAMING) {
+            listener.onMessage(request);
+            listener.onHalfClose();
         }
     }
 
