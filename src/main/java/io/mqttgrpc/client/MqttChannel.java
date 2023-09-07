@@ -27,7 +27,6 @@ public class MqttChannel extends Channel {
     private static final Logger log = LoggerFactory.getLogger(MqttChannel.class);
 
     private final Mqtt5AsyncClient mqttClient;
-    private final String topicPrefix;
     private final String clientId;
     private final int timeoutSeconds;
 
@@ -50,7 +49,6 @@ public class MqttChannel extends Channel {
                 int timeoutSeconds,
                 MqttQos qos) {
         this.mqttClient = mqttClient;
-        this.topicPrefix = topicPrefix;
         this.clientId = clientId;
         this.timeoutSeconds = timeoutSeconds;
         this.qos = qos;
@@ -58,11 +56,24 @@ public class MqttChannel extends Channel {
         registeredResponseTopics = Collections.synchronizedSet(new HashSet<>());
         contexts = new ConcurrentHashMap<>();
         if (interceptors.size() > 0) {
-            actualChannel = ClientInterceptors.intercept(new ActualMqttChannel(), interceptors);
+            actualChannel = ClientInterceptors.intercept(new ActualMqttChannel(topicPrefix), interceptors);
         } else {
-            actualChannel = new ActualMqttChannel();
+            actualChannel = new ActualMqttChannel(topicPrefix);
         }
         timeoutTasks = new ConcurrentHashMap<>();
+    }
+
+    /**
+     * Return a new "separate" Channel using this {@link MqttChannel} as a container.
+     *
+     * @param topicPrefix prefix for the new channel.
+     * @return {@link Channel} to be used for other stubs.
+     */
+    public ActualMqttChannel getChannel(String topicPrefix) {
+        if (topicPrefix == null || topicPrefix.isBlank()) {
+            throw new IllegalStateException("topic prefix must not be blank");
+        }
+        return new ActualMqttChannel(topicPrefix);
     }
 
     @SuppressWarnings("unchecked")
@@ -147,6 +158,12 @@ public class MqttChannel extends Channel {
     }
 
     public final class ActualMqttChannel extends Channel {
+
+        private final String topicPrefix;
+
+        public ActualMqttChannel(final String topicPrefix) {
+            this.topicPrefix = topicPrefix;
+        }
 
         @Override
         public String authority() {
