@@ -12,4 +12,7 @@ public class Constants {
 
     // Payload sent by MqttServer when a message is not implemented and the server is configured to respond as such.
     public static final byte[] NOT_IMPLEMENTED_PAYLOAD = "NOT IMPLEMENTED".getBytes(StandardCharsets.UTF_8);
+
+    public static final String USER_PROPERTY_MESSAGE_TYPE = "grpc-message-type";
+    public static final String USER_PROPERTY_MESSAGE_TYPE_STATUS = "status";
 }

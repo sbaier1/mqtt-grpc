@@ -3,6 +3,8 @@ package io.mqttgrpc.server;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.datatypes.MqttTopic;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5Client;
+import com.hivemq.client.mqtt.mqtt5.datatypes.Mqtt5UserProperties;
+import com.hivemq.client.mqtt.mqtt5.datatypes.Mqtt5UserProperty;
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
@@ -16,6 +18,9 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
+
+import static io.mqttgrpc.Constants.USER_PROPERTY_MESSAGE_TYPE;
+import static io.mqttgrpc.Constants.USER_PROPERTY_MESSAGE_TYPE_STATUS;
 
 
 /**
@@ -103,6 +108,26 @@ public class MqttServerCall<ReqT, RespT> extends ServerCall<ReqT, RespT> {
         if (status.isOk()) {
             // The call completed successfully. If sendMessage() wasn't called yet, you may want to handle this case.
         } else {
+            if (publish.getResponseTopic().isPresent() && publish.getCorrelationData().isPresent()) {
+                final MqttTopic responseTopic = publish.getResponseTopic().get();
+                final Optional<ByteBuffer> correlationData = publish.getCorrelationData();
+                byte[] correlationBytes = new byte[correlationData.get().remaining()];
+                correlationData.get().get(correlationBytes);
+                mqttClient.toAsync().publishWith()
+                        .topic(responseTopic)
+                        .qos(qos)
+                        .payload(String.valueOf(status.getCode().value()).getBytes())
+                        .correlationData(ByteBuffer.wrap(correlationBytes))
+                        .userProperties(Mqtt5UserProperties.of(Mqtt5UserProperty.of(USER_PROPERTY_MESSAGE_TYPE, USER_PROPERTY_MESSAGE_TYPE_STATUS)))
+                        .send()
+                        .whenComplete((mqtt5PublishResult, throwable) -> {
+                            if (throwable != null) {
+                                log.error("Failed to publish response for request received on topic {} to response topic {}", publish.getTopic(), responseTopic);
+                            }
+                        });
+            } else {
+                log.error("Unexpected: Correlation data or response topic missing in publish {}", publish);
+            }
             // The call failed. Send an error status back to the client, e.g., as an MQTT message.
             // This can be done using a different topic, or by encoding the error status in the MQTT message payload.
         }

@@ -3,23 +3,18 @@ package io.mqttgrpc.server;
 import com.hivemq.client.mqtt.MqttClient;
 import com.hivemq.client.mqtt.MqttClientBuilder;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
-import com.hivemq.client.mqtt.datatypes.MqttTopic;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5Client;
 import com.hivemq.client.mqtt.mqtt5.message.connect.Mqtt5ConnectBuilder;
 import com.hivemq.client.mqtt.mqtt5.message.connect.connack.Mqtt5ConnAck;
-import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish;
 import io.grpc.BindableService;
 import io.grpc.ServerInterceptor;
-import io.reactivex.Flowable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 import static com.hivemq.client.mqtt.mqtt5.message.connect.connack.Mqtt5ConnAckReasonCode.SUCCESS;
-import static io.mqttgrpc.Constants.PING_SUFFIX;
 
 /**
  * Sort of similar to a {@link io.grpc.ServerBuilder} but as agnostic as possible to any HTTP specific stuff, but adjusted to fit MQTT as transport instead.
@@ -183,32 +178,9 @@ public class MqttServerBuilder {
             }
         }
 
-        addServicePingResponder();
-
         return new MqttServer(client, services, interceptors, topicPrefix, qos, respondNotImplemented);
     }
 
-
-    private void addServicePingResponder() {
-        client.toAsync()
-                .subscribeWith()
-                .topicFilter(topicPrefix + PING_SUFFIX)
-                .qos(qos)
-                .callback(mqtt5Publish -> {
-                    final Optional<MqttTopic> topicOptional = mqtt5Publish.getResponseTopic();
-                    topicOptional.ifPresent(mqttTopic -> client.toRx()
-                            .publish(Flowable.just(Mqtt5Publish.builder()
-                                    .topic(mqttTopic)
-                                    .qos(MqttQos.AT_LEAST_ONCE)
-                                    .payload("OK".getBytes())
-                                    .build()))
-                            .subscribe(mqtt5PublishResult -> mqtt5PublishResult.getError()
-                                    .ifPresentOrElse(throwable -> log.error("Failed to respond to service ping", throwable),
-                                            () -> log.debug("Responded to ping on topic {}", mqttTopic)))
-                            .dispose());
-                })
-                .send();
-    }
 
     private void assertNotEmptyOrNull(final String field, final String name) {
         if (field == null || field.isBlank()) {

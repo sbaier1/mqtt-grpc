@@ -1,4 +1,5 @@
 package io.mqttgrpc;
+
 import com.hivemq.client.mqtt.MqttClient;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient;
@@ -27,6 +28,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.assertThrows;
 
 /**
  * @author Simon Baier
@@ -63,6 +65,45 @@ public class MqttGrpcIntegrationTest {
         if (mqttServer != null) {
             mqttServer.stop();
         }
+    }
+
+    @NotNull
+    private static ServerInterceptor getNoopInterceptor() {
+        return new ServerInterceptor() {
+            @Override
+            public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+                final ServerCall.Listener<ReqT> listener = next.startCall(call, headers);
+                return new ServerCall.Listener<ReqT>() {
+                    @Override
+                    public void onMessage(ReqT message) {
+                        System.out.println("Intercepted request example: " + message);
+                        // Process the request message
+
+                        // Forward the message to the next listener in the chain
+                        listener.onMessage(message);
+                    }
+
+                    @Override
+                    public void onHalfClose() {
+                        // Handle the client indicating it has finished sending messages
+                        listener.onHalfClose();
+                    }
+
+                    @Override
+                    public void onCancel() {
+                        // Handle cancellation of the RPC call
+                        listener.onCancel();
+                    }
+
+
+                    @Override
+                    public void onComplete() {
+                        // Handle the completion of the RPC call
+                        listener.onComplete();
+                    }
+                };
+            }
+        };
     }
 
     @NotNull
@@ -129,112 +170,17 @@ public class MqttGrpcIntegrationTest {
                 .join();
     }
 
-    @Test
-    void pingPong_shared_subscription() {
-        mqttServer = MqttServer.builder()
-                .clientId("server")
-                .topicPrefix("$share/group1/" + topicPrefix)
-                .brokerAddress(brokerUrl)
-                .port(mqttPort)
-                .addService(getMockImpl())
-                .addInterceptor(getNoopInterceptor())
-                .build();
-        mqttServer.start();
-
-        // Create the gRPC channel using the MqttChannel implementation
-        mqttChannel = MqttChannel.builder()
-                .clientId("client")
-                .topicPrefix(topicPrefix)
-                .brokerAddress(brokerUrl)
-                .port(mqttPort)
-                .intercept(getSampleInterceptor())
-                .build();
-        client = PingServiceGrpc.newBlockingStub(mqttChannel);
-
-        PingRequest request = PingRequest.newBuilder()
-                .setPayload("Hello")
-                .build();
-        PingResponse response = client.ping(request);
-        assertThat(response.getPayload()).isEqualTo("Pong: Hello");
-
-        mqttServer.stop();
-        mqttChannel.close();
-    }
-
-    @Test
-    void pingPong_pingService_noServer() {
-        // Create the gRPC channel using the MqttChannel implementation
-        assertThatThrownBy(() -> MqttChannel.builder()
-                .clientId("client")
-                .topicPrefix(topicPrefix)
-                .brokerAddress(brokerUrl)
-                .port(mqttPort)
-                .intercept(getSampleInterceptor())
-                .pingDeadlineSeconds(5)
-                .build(), "starting the channel must time out due to missing backend");
-    }
-
-    // TODO test case: server is present but does not implement method
-
-    @Test
-    void pingPong_noPingService_noServer() {
-        // Create the gRPC channel using the MqttChannel implementation
-        mqttChannel = MqttChannel.builder()
-                .clientId("client")
-                .topicPrefix(topicPrefix)
-                .brokerAddress(brokerUrl)
-                .port(mqttPort)
-                .intercept(getSampleInterceptor())
-                .pingService(false)
-                .timeout(2)
-                .build();
-        client = PingServiceGrpc.newBlockingStub(mqttChannel);
-
-        PingRequest request = PingRequest.newBuilder()
-                .setPayload("Hello")
-                .build();
-        assertThatThrownBy(() -> client.withDeadlineAfter(5, TimeUnit.SECONDS).ping(request), "client query must time out");
-        mqttChannel.close();
-    }
-
     @NotNull
-    private static ServerInterceptor getNoopInterceptor() {
-        return new ServerInterceptor() {
+    private static PingServiceGrpc.PingServiceImplBase getBrokenImpl() {
+        return new PingServiceGrpc.PingServiceImplBase() {
             @Override
-            public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
-                final ServerCall.Listener<ReqT> listener = next.startCall(call, headers);
-                return new ServerCall.Listener<ReqT>() {
-                    @Override
-                    public void onMessage(ReqT message) {
-                        System.out.println("Intercepted request example: " + message);
-                        // Process the request message
-
-                        // Forward the message to the next listener in the chain
-                        listener.onMessage(message);
-                    }
-
-                    @Override
-                    public void onHalfClose() {
-                        // Handle the client indicating it has finished sending messages
-                        listener.onHalfClose();
-                    }
-
-                    @Override
-                    public void onCancel() {
-                        // Handle cancellation of the RPC call
-                        listener.onCancel();
-                    }
-
-
-                    @Override
-                    public void onComplete() {
-                        // Handle the completion of the RPC call
-                        listener.onComplete();
-                    }
-                };
+            public void ping(PingRequest request, StreamObserver<PingResponse> responseObserver) {
+                throw new IllegalStateException("oops");
             }
         };
     }
+
+    // TODO test case: server is present but does not implement method
 
     @Test
     void pingRequest_ExpectPongResponse() {
@@ -301,6 +247,72 @@ public class MqttGrpcIntegrationTest {
         mqttChannel.close();
     }
 
+    @Test
+    void pingPong_shared_subscription() {
+        mqttServer = MqttServer.builder()
+                .clientId("server")
+                .topicPrefix("$share/group1/" + topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .addService(getMockImpl())
+                .addInterceptor(getNoopInterceptor())
+                .build();
+        mqttServer.start();
+
+        // Create the gRPC channel using the MqttChannel implementation
+        mqttChannel = MqttChannel.builder()
+                .clientId("client")
+                .topicPrefix(topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .intercept(getSampleInterceptor())
+                .build();
+        client = PingServiceGrpc.newBlockingStub(mqttChannel);
+
+        PingRequest request = PingRequest.newBuilder()
+                .setPayload("Hello")
+                .build();
+        PingResponse response = client.ping(request);
+        assertThat(response.getPayload()).isEqualTo("Pong: Hello");
+
+        mqttServer.stop();
+        mqttChannel.close();
+    }
+
+    @Test
+    void pingPong_pingService_noServer() {
+        // Create the gRPC channel using the MqttChannel implementation
+        assertThatThrownBy(() -> MqttChannel.builder()
+                .clientId("client")
+                .topicPrefix(topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .intercept(getSampleInterceptor())
+                .pingDeadlineSeconds(5)
+                .build(), "starting the channel must time out due to missing backend");
+    }
+
+    @Test
+    void pingPong_noPingService_noServer() {
+        // Create the gRPC channel using the MqttChannel implementation
+        mqttChannel = MqttChannel.builder()
+                .clientId("client")
+                .topicPrefix(topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .intercept(getSampleInterceptor())
+                .pingService(false)
+                .timeout(2)
+                .build();
+        client = PingServiceGrpc.newBlockingStub(mqttChannel);
+
+        PingRequest request = PingRequest.newBuilder()
+                .setPayload("Hello")
+                .build();
+        assertThatThrownBy(() -> client.withDeadlineAfter(5, TimeUnit.SECONDS).ping(request), "client query must time out");
+        mqttChannel.close();
+    }
+
     @NotNull
     private static PingServiceGrpc.PingServiceImplBase getMockImpl() {
         return new PingServiceGrpc.PingServiceImplBase() {
@@ -313,4 +325,34 @@ public class MqttGrpcIntegrationTest {
             }
         };
     }
+
+    @Test
+    void pingRequest_ServerWillFail() {
+        mqttServer = MqttServer.builder()
+                .clientId("server")
+                .topicPrefix(topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .addService(getBrokenImpl())
+                .build();
+        mqttServer.start();
+
+        // Create the gRPC channel using the MqttChannel implementation
+        mqttChannel = MqttChannel.builder()
+                .clientId("client")
+                .topicPrefix(topicPrefix)
+                .brokerAddress(brokerUrl)
+                .port(mqttPort)
+                .build();
+        client = PingServiceGrpc.newBlockingStub(mqttChannel);
+
+        PingRequest request = PingRequest.newBuilder()
+                .setPayload("Hello")
+                .build();
+        assertThrows(StatusRuntimeException.class, () -> client.ping(request));
+
+        mqttServer.stop();
+        mqttChannel.close();
+    }
+
 }

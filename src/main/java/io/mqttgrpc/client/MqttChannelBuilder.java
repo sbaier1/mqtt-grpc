@@ -170,7 +170,7 @@ public class MqttChannelBuilder {
             try {
                 final boolean reached = latch.await(pingDeadlineSeconds, TimeUnit.SECONDS);
                 if (!reached) {
-                    throw new IllegalStateException("Failed to ping service in " + pingDeadlineSeconds + "s");
+                    throw new IllegalStateException("Failed to ping service in " + pingDeadlineSeconds + "s for topic prefix " + topicPrefix);
                 }
                 log.debug("Backend service is present, proceeding");
             } catch (InterruptedException e) {
